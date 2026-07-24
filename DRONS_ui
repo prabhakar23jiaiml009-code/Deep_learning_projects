@@ -1,0 +1,613 @@
+import pygame
+import sys
+import math
+import random
+
+pygame.init()
+
+WIDTH, HEIGHT = 1024, 768
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Corporate UAV Fleet Dashboard - High-Coverage System v4.0")
+
+SKY_BLUE = (155, 198, 233)
+SKY_WHITE = (225, 238, 247)
+FIELD_GREEN = (126, 163, 89)
+FIELD_DARK_GREEN = (98, 133, 62)
+HORIZON_HILLS = (110, 145, 80)
+FENCE_COLOR = (180, 185, 175)
+
+DRONE_NEON_COLORS = [
+    (0,   230, 255),
+    (180, 0,   255),
+    (255, 0,   180),
+    (0,   255, 120),
+    (255, 220,  0),
+]
+
+GRID_LEFT = 60
+GRID_RIGHT = WIDTH - 60
+GRID_TOP = HEIGHT - 560
+GRID_BOTTOM = HEIGHT - 160
+GRID_COLS = 8
+GRID_ROWS = 6
+
+cell_w = (GRID_RIGHT - GRID_LEFT) / GRID_COLS
+cell_h = (GRID_BOTTOM - GRID_TOP) / GRID_ROWS
+
+grid_cells = []
+for row in range(GRID_ROWS):
+    for col in range(GRID_COLS):
+        cx = GRID_LEFT + col * cell_w + cell_w / 2
+        cy = GRID_TOP + row * cell_h + cell_h / 2
+        grid_cells.append((cx, cy))
+
+visited_cells = set()
+GROUND_Y = HEIGHT - 185
+
+LANDING_SPOTS = [
+    (160, GROUND_Y), (280, GROUND_Y), (400, GROUND_Y),
+    (540, GROUND_Y), (680, GROUND_Y),
+]
+TAKEOFF_HOVER_Y = [
+    HEIGHT - 330, HEIGHT - 410, HEIGHT - 470,
+    HEIGHT - 400, HEIGHT - 340,
+]
+
+sim_started = False
+
+
+def draw_racing_drone(surface, bx, by, prop_angle, prop_spin, neon_color,
+                      smooth_vx, smooth_vy, state, led_tick, battery,
+                      grounded=False):
+    nc = neon_color
+    dim = 0.35 if grounded else 1.0
+
+    def d(c):
+        return tuple(max(0, int(v * dim)) for v in c)
+
+    tilt_x = int(smooth_vx * 2.5)
+    tilt_y = int(smooth_vy * 1.2)
+    arm_len = 30
+    angle_offsets = [math.radians(45), math.radians(135), math.radians(225), math.radians(315)]
+    rotor_positions = []
+
+    for ao in angle_offsets:
+        rx = bx + int(math.cos(ao) * arm_len) + tilt_x
+        ry = by + int(math.sin(ao) * arm_len * 0.6) + tilt_y
+        rotor_positions.append((rx, ry))
+
+    if not grounded:
+        ground_y = GROUND_Y
+        altitude_factor = max(0.25, (ground_y - by) / 300.0)
+        sw = int(70 / altitude_factor)
+        sh = int(10 / altitude_factor)
+        shad = pygame.Surface((sw * 2, sh * 2), pygame.SRCALPHA)
+        pygame.draw.ellipse(shad, (10, 10, 10, 90), (0, 0, sw, sh))
+        surface.blit(shad, (bx - sw // 2, ground_y + 38))
+
+    arm_color_main = d((35, 38, 42))
+    arm_color_stripe = d((nc[0] // 3, nc[1] // 3, nc[2] // 3))
+
+    for i in range(4):
+        rx, ry = rotor_positions[i]
+        pygame.draw.aaline(surface, arm_color_main, (bx, by), (rx, ry))
+        pygame.draw.aaline(surface, arm_color_stripe, (bx, by), (rx, ry))
+
+    cross_size = 10
+    body_pts = [
+        (bx - cross_size, by - 4), (bx - 4, by - cross_size),
+        (bx + 4, by - cross_size), (bx + cross_size, by - 4),
+        (bx + cross_size, by + 4), (bx + 4, by + cross_size),
+        (bx - 4, by + cross_size), (bx - cross_size, by + 4),
+    ]
+    pygame.draw.polygon(surface, d((22, 25, 30)), body_pts)
+    pygame.draw.polygon(surface, d((40, 44, 50)), body_pts, 1)
+
+    pygame.draw.aaline(surface, d((30, 33, 38)), (bx - cross_size, by), (bx + cross_size, by))
+    pygame.draw.aaline(surface, d((30, 33, 38)), (bx, by - cross_size), (bx, by + cross_size))
+
+    cam_x = bx + tilt_x + 6
+    cam_y = by + tilt_y - 2
+    pygame.draw.ellipse(surface, d((18, 20, 25)), (cam_x - 5, cam_y - 3, 10, 6))
+    pygame.draw.circle(surface, d((8, 10, 15)), (cam_x, cam_y), 3)
+    pygame.draw.circle(surface, d((nc[0] // 4, nc[1] // 4, nc[2] // 4)), (cam_x, cam_y), 2)
+
+    rotor_radius = 16
+    blade_len = 14
+
+    for idx, (rx, ry) in enumerate(rotor_positions):
+        pygame.draw.circle(surface, d((30, 33, 38)), (rx, ry), rotor_radius, 1)
+        pygame.draw.circle(surface, d((20, 22, 28)), (rx, ry), 5)
+        pygame.draw.circle(surface, d((50, 55, 65)), (rx, ry), 3)
+
+        if not grounded:
+            ring_surf = pygame.Surface((rotor_radius * 2 + 4, rotor_radius * 2 + 4), pygame.SRCALPHA)
+            pygame.draw.circle(ring_surf, (nc[0], nc[1], nc[2], 60), (rotor_radius + 2, rotor_radius + 2), rotor_radius, 2)
+            surface.blit(ring_surf, (rx - rotor_radius - 2, ry - rotor_radius - 2))
+
+        angle = prop_angle + idx * (math.pi / 2)
+        for blade_angle in [angle, blade_len + math.pi]:
+            bpx = int(rx + blade_len * math.cos(blade_angle))
+            bpy = int(ry + blade_len * math.sin(blade_angle) * 0.5)
+            pygame.draw.aaline(surface, d((15, 16, 20)), (rx, ry), (bpx, bpy))
+            tip_x = int(rx + (blade_len - 4) * math.cos(blade_angle))
+            tip_y = int(ry + (blade_len - 4) * math.sin(blade_angle) * 0.5)
+            pygame.draw.aaline(surface, d((nc[0] // 2, nc[1] // 2, nc[2] // 2)), (tip_x, tip_y), (bpx, bpy))
+
+        if prop_spin > 0.1:
+            blur = pygame.Surface((rotor_radius * 2, rotor_radius), pygame.SRCALPHA)
+            alpha = int(110 * prop_spin)
+            pygame.draw.ellipse(blur, (nc[0], nc[1], nc[2], alpha), (0, 0, rotor_radius * 2, rotor_radius), 2)
+            surface.blit(blur, (rx - rotor_radius, ry - rotor_radius // 2))
+
+    leg_col = d((45, 48, 55))
+    neon_foot = d((nc[0] // 3, nc[1] // 3, nc[2] // 3))
+    pygame.draw.aaline(surface, leg_col, (bx - 8, by + 8), (bx - 10, by + 20))
+    pygame.draw.aaline(surface, leg_col, (bx + 8, by + 8), (bx + 10, by + 20))
+    pygame.draw.aaline(surface, neon_foot, (bx - 14, by + 20), (bx - 4, by + 20))
+    pygame.draw.aaline(surface, neon_foot, (bx + 4, by + 20), (bx + 14, by + 20))
+
+    if state in ('returning', 'landing'):
+        led_col = d((255, 140, 0))
+    else:
+        led_col = d(nc)
+
+    if led_tick < 30 and not grounded:
+        glow = pygame.Surface((14, 14), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (led_col[0], led_col[1], led_col[2], 100), (7, 7), 6)
+        surface.blit(glow, (bx - 7, by - 7))
+        pygame.draw.circle(surface, led_col, (bx, by), 2)
+
+    return rotor_positions
+
+
+class RealisticDrone:
+    def __init__(self, drone_id, start_x, start_y, landing_spot_idx):
+        self.id = drone_id
+        self.x = float(start_x)
+        self.y = float(start_y)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.target_x = float(start_x)
+        self.target_y = float(start_y)
+        self.smooth_vx = 0.0
+        self.smooth_vy = 0.0
+
+        self.prop_angle = random.uniform(0, math.pi * 2)
+        self.sway_offset = random.uniform(0, 100)
+        self.led_tick = random.randint(0, 60)
+        self.attended_cells = set()
+
+        self.cell_queue = []
+        for idx in range(len(grid_cells)):
+            if idx % 5 == (drone_id - 1):
+                self.cell_queue.append(idx)
+        extra_cells = [i for i in range(len(grid_cells)) if i not in self.cell_queue]
+        random.shuffle(extra_cells)
+        self.cell_queue.extend(extra_cells)
+
+        self.queue_idx = 0
+        self.visit_timer = 0
+        self.visit_hold = 20
+
+        self.safe_distance = 150.0
+        self.max_speed = 3.5
+        self.accel = 0.05
+        self.drag = 0.86
+
+        self.battery = 100.0
+        self.battery_drain_per_frame = random.uniform(0.022, 0.035)
+        self.low_battery_threshold = 15.0
+
+        self.landing_spot_idx = landing_spot_idx
+        self.land_x, self.land_y = LANDING_SPOTS[landing_spot_idx]
+        self.land_x += (drone_id - 3) * 6  # FIX 1: small offset so drones don't stack on ground
+        self.safe_corridor_y = HEIGHT - 290 - (drone_id * 28)
+
+        self.state = 'grounded'
+        self.prop_spin = 0.0
+
+        self.takeoff_target_y = TAKEOFF_HOVER_Y[drone_id - 1]
+        self.takeoff_delay = (drone_id - 1) * 45
+        self.takeoff_timer = 0
+
+        self.neon_color = DRONE_NEON_COLORS[(drone_id - 1) % len(DRONE_NEON_COLORS)]
+        self._set_next_target()
+
+    # FIX 2: allow relaunch from 'landed' state and reset battery/mission
+    def start_takeoff(self):
+        if self.state in ('grounded', 'landed'):
+            self.state = 'spooling'
+            self.takeoff_timer = 0
+            self.battery = 100.0
+            self.attended_cells = set()
+            self.queue_idx = 0
+            self.prop_spin = 0.0
+            self.vx = 0.0
+            self.vy = 0.0
+            self.smooth_vx = 0.0
+            self.smooth_vy = 0.0
+
+    def get_battery_color(self):
+        if self.battery > 50:
+            t = (self.battery - 50) / 50.0
+            return (int(255 * (1 - t)), 200, 40)
+        else:
+            return (230, int(180 * self.battery / 50.0), 0)
+
+    def _set_next_target(self):
+        if self.queue_idx < len(self.cell_queue):
+            cell_idx = self.cell_queue[self.queue_idx]
+            self.target_x, self.target_y = grid_cells[cell_idx]
+        else:
+            cx, cy = random.choice(grid_cells)
+            self.target_x, self.target_y = cx, cy
+
+    def handle_collision_avoidance(self, all_drones):
+        in_collision_zone = False
+
+        for other in all_drones:
+            if other.id == self.id or other.state in ('grounded', 'spooling', 'landed'):
+                continue
+
+            dx = self.x - other.x
+            dy = self.y - other.y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            current_safe_dist = self.safe_distance if (self.state == 'flying' and other.state == 'flying') else 100.0
+            if dist < current_safe_dist:
+                in_collision_zone = True
+                if dist == 0:
+                    dx = random.uniform(-1, 1)
+                    dy = random.uniform(-1, 1)
+                    dist = math.sqrt(dx * dx + dy * dy)
+
+                push_factor = (current_safe_dist - dist) / current_safe_dist
+                push_mag = 24.0 * (push_factor ** 2)
+
+                self.vx += (dx / dist) * push_mag
+                self.vy += (dy / dist) * push_mag
+
+                perpendicular_x = -dy / dist
+                perpendicular_y = dx / dist
+                self.vx += perpendicular_x * (12.0 * push_factor)
+                self.vy += perpendicular_y * (12.0 * push_factor)
+
+        return in_collision_zone
+
+    def update(self, all_drones):
+        if self.state == 'grounded':
+            self.prop_spin = 0.0
+            return
+
+        if self.state == 'spooling':
+            self.takeoff_timer += 1
+            self.prop_spin = min(1.0, self.takeoff_timer / 40.0)
+            self.prop_angle += 0.5 * self.prop_spin
+            self.led_tick = (self.led_tick + 1) % 60
+            if self.takeoff_timer >= self.takeoff_delay + 40:
+                self.state = 'takeoff'
+            return
+
+        if self.state == 'takeoff':
+            self.battery = max(0.0, self.battery - self.battery_drain_per_frame * 0.4)
+            self.y -= 1.2
+            self.x += math.sin(self.takeoff_timer * 0.03 + self.id) * 0.15
+            self.takeoff_timer += 1
+            self.prop_spin = 1.0
+            self.prop_angle += 0.4
+            self.led_tick = (self.led_tick + 1) % 60
+            if self.y <= self.takeoff_target_y:
+                self.y = float(self.takeoff_target_y)
+                self.state = 'flying'
+                self._set_next_target()
+            return
+
+        if self.state == 'landed':
+            self.prop_spin = max(0.0, self.prop_spin - 0.02)
+            self.prop_angle += 0.35 * self.prop_spin
+            return
+
+        if self.state == 'returning':
+            self.battery = max(0.0, self.battery - self.battery_drain_per_frame * 0.2)
+            tx, ty = self.land_x, self.safe_corridor_y
+
+            dx = tx - self.x
+            dy = ty - self.y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            self.vx += (dx / max(1, dist)) * 0.7
+            self.vy += (dy / max(1, dist)) * 0.7
+
+            self.handle_collision_avoidance(all_drones)
+
+            speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
+            if speed > 2.8:
+                self.vx = (self.vx / speed) * 2.8
+                self.vy = (self.vy / speed) * 2.8
+
+            self.vx *= self.drag
+            self.vy *= self.drag
+            self.x += self.vx
+            self.y += self.vy
+
+            self.smooth_vx += (self.vx - self.smooth_vx) * 0.1
+            self.smooth_vy += (self.vy - self.smooth_vy) * 0.1
+
+            if math.sqrt((self.x - tx) ** 2 + (self.y - ty) ** 2) < 15:
+                self.state = 'landing'
+            return
+
+        if self.state == 'landing':
+            tx, ty = self.land_x, self.land_y
+            if abs(self.x - tx) > 2:
+                self.vx += (tx - self.x) * 0.12
+            else:
+                self.vx = 0.0
+                self.x = float(tx)
+
+            self.vy += (ty - self.y) * 0.025
+            self.handle_collision_avoidance(all_drones)  # FIX 3: avoid collision during landing
+            self.vx *= 0.55
+            self.vy *= 0.55
+            self.x += self.vx
+            self.y += self.vy
+
+            self.smooth_vx += (self.vx - self.smooth_vx) * 0.1
+            self.smooth_vy += (self.vy - self.smooth_vy) * 0.1
+
+            self.prop_spin = max(0.25, self.prop_spin - 0.005)
+
+            if self.y >= ty or math.sqrt((self.x - tx)**2 + (self.y - ty)**2) < 4:
+                self.x, self.y = float(tx), float(ty)
+                self.vx = self.vy = 0.0
+                self.smooth_vx = self.smooth_vy = 0.0
+                self.state = 'landed'
+                self.prop_spin = 0.0
+            return
+
+        self.battery = max(0.0, self.battery - self.battery_drain_per_frame)
+        if self.battery <= self.low_battery_threshold:
+            self.state = 'returning'
+            return
+
+        self.sway_offset += 0.02
+        sx = math.cos(self.sway_offset * 0.4) * 0.8
+        sy = math.sin(self.sway_offset * 0.5) * 0.8
+
+        is_avoiding = self.handle_collision_avoidance(all_drones)
+
+        if not is_avoiding:
+            self.vx += (self.target_x + sx - self.x) * self.accel
+            self.vy += (self.target_y + sy - self.y) * self.accel
+            current_max_speed = self.max_speed
+        else:
+            self.vx += (self.target_x - self.x) * 0.0
+            self.vy += (self.target_y - self.y) * 0.0
+            current_max_speed = self.max_speed * 1.1
+
+        speed = math.sqrt(self.vx ** 2 + self.vy ** 2)
+        if speed > current_max_speed:
+            self.vx = (self.vx / speed) * current_max_speed
+            self.vy = (self.vy / speed) * current_max_speed
+
+        self.vx *= self.drag
+        self.vy *= self.drag
+        self.x += self.vx
+        self.y += self.vy
+
+        self.smooth_vx += (self.vx - self.smooth_vx) * 0.1
+        self.smooth_vy += (self.vy - self.smooth_vy) * 0.1
+
+        buffer = 35
+        if self.x < GRID_LEFT + buffer:
+            self.x = GRID_LEFT + buffer
+            self.vx *= -0.2
+        elif self.x > GRID_RIGHT - buffer:
+            self.x = GRID_RIGHT - buffer
+            self.vx *= -0.2
+        if self.y < GRID_TOP + buffer:
+            self.y = GRID_TOP + buffer
+            self.vy *= -0.2
+        elif self.y > GRID_BOTTOM - buffer:
+            self.y = GRID_BOTTOM - buffer
+            self.vy *= -0.2
+
+        self.prop_angle += 0.4
+        self.prop_spin = 1.0
+        self.led_tick = (self.led_tick + 1) % 60
+
+        dx = self.x - self.target_x
+        dy = self.y - self.target_y
+        if math.sqrt(dx * dx + dy * dy) < 40:
+            if self.queue_idx < len(self.cell_queue):
+                cell_idx = self.cell_queue[self.queue_idx]
+                visited_cells.add(cell_idx)
+                self.attended_cells.add(cell_idx)
+
+            self.visit_timer += 1
+            if self.visit_timer >= self.visit_hold:
+                self.visit_timer = 0
+                self.queue_idx += 1
+                self._set_next_target()
+
+    def draw(self, surface):
+        grounded = self.state in ('grounded',) or (self.state == 'landed' and self.prop_spin == 0.0)
+        bx, by = int(self.x), int(self.y)
+
+        draw_racing_drone(
+            surface, bx, by, self.prop_angle, self.prop_spin,
+            self.neon_color, self.smooth_vx, self.smooth_vy,
+            self.state, self.led_tick, self.battery, grounded=grounded
+        )
+
+        font_id = pygame.font.Font(None, 15)
+        nc = self.neon_color
+        dim = 0.35 if grounded else 1.0
+        lbl_col = tuple(max(0, int(v * dim)) for v in nc)
+        lbl = font_id.render(f"SYS_UAV_{self.id:02d}", True, lbl_col)
+        surface.blit(lbl, (bx - 30, by - 42))
+
+        if not grounded:
+            self._draw_battery_bar(surface, bx, by)
+
+    def _draw_battery_bar(self, surface, bx, by):
+        bar_w, bar_h = 50, 6
+        bar_x = bx - bar_w // 2
+        bar_y = by - 54
+        pygame.draw.rect(surface, (20, 20, 35), (bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2), border_radius=3)
+        fill_w = int((self.battery / 100.0) * bar_w)
+        if fill_w > 0:
+            pygame.draw.rect(surface, self.get_battery_color(), (bar_x, bar_y, fill_w, bar_h), border_radius=2)
+
+
+def draw_grid(surface):
+    for cell_idx in range(len(grid_cells)):
+        col = cell_idx % GRID_COLS
+        row = cell_idx // GRID_COLS
+        rx = int(GRID_LEFT + col * cell_w)
+        ry = int(GRID_TOP + row * cell_h)
+        rw, rh = int(cell_w), int(cell_h)
+        base = pygame.Surface((rw, rh), pygame.SRCALPHA)
+        base.fill((0, 0, 0, 35))
+        surface.blit(base, (rx, ry))
+
+        if cell_idx in visited_cells:
+            highlight = pygame.Surface((rw, rh), pygame.SRCALPHA)
+            highlight.fill((60, 200, 80, 150))
+            surface.blit(highlight, (rx, ry))
+            pygame.draw.rect(surface, (240, 255, 160), (rx, ry, rw, rh), 2)
+
+    gs = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    line_color = (255, 255, 255, 180)
+
+    for row in range(GRID_ROWS + 1):
+        y = int(GRID_TOP + row * cell_h)
+        pygame.draw.line(gs, line_color, (GRID_LEFT, y), (GRID_RIGHT, y), 1)
+
+    for col in range(GRID_COLS + 1):
+        x = int(GRID_LEFT + col * cell_w)
+        pygame.draw.line(gs, line_color, (x, GRID_TOP), (x, GRID_BOTTOM), 1)
+
+    surface.blit(gs, (0, 0))
+
+    font_cell = pygame.font.Font(None, 15)
+    for cell_idx, (cx, cy) in enumerate(grid_cells):
+        lbl = font_cell.render(f"C{cell_idx + 1:02d}", True, (230, 240, 230))
+        surface.blit(lbl, (int(cx - 10), int(cy - 7)))
+
+
+def draw_background(surface):
+    for y in range(0, HEIGHT - 260):
+        blend = y / (HEIGHT - 260)
+        color = [int(SKY_BLUE[c] * (1 - blend) + SKY_WHITE[c] * blend) for c in range(3)]
+        pygame.draw.line(surface, color, (0, y), (WIDTH, y))
+    pygame.draw.polygon(surface, HORIZON_HILLS, [
+        (0, HEIGHT - 260), (300, HEIGHT - 275), (700, HEIGHT - 265),
+        (WIDTH, HEIGHT - 275), (WIDTH, HEIGHT - 230), (0, HEIGHT - 230),
+    ])
+    pygame.draw.line(surface, FENCE_COLOR, (0, HEIGHT - 245), (WIDTH, HEIGHT - 245), 2)
+    for x in range(0, WIDTH, 40):
+        pygame.draw.line(surface, FENCE_COLOR, (x, HEIGHT - 245), (x, HEIGHT - 230), 1)
+    for y in range(HEIGHT - 230, HEIGHT):
+        blend = (y - (HEIGHT - 230)) / 230
+        color = [int(FIELD_GREEN[c] * (1 - blend) + FIELD_DARK_GREEN[c] * blend) for c in range(3)]
+        pygame.draw.line(surface, color, (0, y), (WIDTH, y))
+
+
+def draw_active_button(surface, started):
+    btn_w, btn_h = 130, 38
+    btn_x = WIDTH - btn_w - 12
+    btn_y = 15 + (20 + 5 * 22 + 8) + 10
+    pygame.draw.rect(surface, (5, 5, 5), (btn_x + 3, btn_y + 3, btn_w, btn_h), border_radius=10)
+    if started:
+        top_col, bot_col, txt_col, label = (30, 150, 55), (15, 85, 28), (180, 255, 195), "● ACTIVE"
+    else:
+        top_col, bot_col, txt_col, label = (25, 130, 70), (12, 75, 38), (210, 255, 220), "▶️  START"
+    pygame.draw.rect(surface, top_col, (btn_x, btn_y, btn_w, btn_h), border_radius=10)
+    pygame.draw.rect(surface, bot_col, (btn_x + 2, btn_y + btn_h // 2, btn_w - 4, btn_h // 2 - 2), border_radius=6)
+    pygame.draw.rect(surface, (200, 255, 210), (btn_x, btn_y, btn_w, btn_h), 2, border_radius=10)
+    txt = pygame.font.Font(None, 26).render(label, True, txt_col)
+    surface.blit(txt, txt.get_rect(center=(btn_x + btn_w // 2, btn_y + btn_h // 2)))
+    return btn_x, btn_y
+
+
+drones = [RealisticDrone(i + 1, LANDING_SPOTS[i][0], GROUND_Y, i) for i in range(5)]
+clock = pygame.time.Clock()
+running = True
+BTN_W, BTN_H = 130, 38
+BTN_X = WIDTH - BTN_W - 12
+BTN_Y = 15 + (20 + 5 * 22 + 8) + 10
+
+while running:
+    clock.tick(60)
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            running = False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if pygame.Rect(BTN_X, BTN_Y, BTN_W, BTN_H).collidepoint(event.pos):
+                sim_started = True
+                for drone in drones:
+                    drone.start_takeoff()
+
+    draw_background(screen)
+    draw_grid(screen)
+
+    for drone in drones:
+        drone.update(drones)
+        drone.draw(screen)
+
+    screen.blit(pygame.font.Font(None, 24).render("Enterprise Fleet Hub - High-Coverage Mesh Simulation", True, (25, 40, 20)), (20, 20))
+
+    font_hud = pygame.font.Font(None, 20)
+    total_cells = len(grid_cells)
+    visited_count = len(visited_cells)
+    coverage = (visited_count / total_cells * 100) if total_cells > 0 else 0
+    screen.blit(font_hud.render(f"Grid Coverage: {visited_count}/{total_cells} cells ({coverage:.1f}%)", True, (20, 60, 20)), (20, 45))
+    screen.blit(font_hud.render("Aviation Anti-Collision Protocol: ACTIVE (Zero-Tolerance Overlap)", True, (50, 180, 50)), (20, 65))
+
+    active_count = sum(1 for d in drones if d.state not in ('landed', 'grounded'))
+    landed_count = sum(1 for d in drones if d.state in ('landed', 'grounded'))
+    screen.blit(font_hud.render(f"UAV Units Airborne: {active_count} | Ground Stationed: {landed_count}", True, (60, 100, 180)), (20, 85))
+
+    panel_x, panel_y, panel_w = WIDTH - 215, 15, 200
+    panel_h = 20 + len(drones) * 22 + 8
+    ps = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    ps.fill((10, 20, 10, 160))
+    screen.blit(ps, (panel_x, panel_y))
+    screen.blit(pygame.font.Font(None, 18).render("BATTERY TELEMETRY", True, (180, 230, 180)), (panel_x + 30, panel_y + 5))
+
+    font_panel = pygame.font.Font(None, 18)
+    for i, drone in enumerate(drones):
+        row_y = panel_y + 22 + i * 22
+        state_label = {'grounded': 'GND', 'spooling': 'SPL', 'takeoff': 'T/O', 'flying': 'FLY', 'returning': 'RTN', 'landing': 'LND', 'landed': 'GND'}.get(drone.state, '---')
+        state_color = {'grounded': (100, 100, 100), 'spooling': (200, 200, 60), 'takeoff': (100, 200, 255), 'flying': (100, 220, 100), 'returning': (255, 165, 0), 'landing': (255, 100, 100), 'landed': (140, 140, 140)}.get(drone.state, (200, 200, 200))
+        screen.blit(font_panel.render(f"UAV_{drone.id:02d}", True, drone.neon_color), (panel_x + 5, row_y))
+        mb_x = panel_x + 60
+        pygame.draw.rect(screen, (20, 20, 35), (mb_x, row_y + 2, 80, 10), border_radius=2)
+        fill = int((drone.battery / 100.0) * 80)
+        if fill > 0:
+            pygame.draw.rect(screen, drone.get_battery_color(), (mb_x, row_y + 2, fill, 10), border_radius=2)
+        screen.blit(font_panel.render(f"{int(drone.battery)}%", True, (210, 215, 210)), (mb_x + 83, row_y))
+        screen.blit(font_panel.render(state_label, True, state_color), (panel_x + 172, row_y))
+
+    draw_active_button(screen, sim_started)
+
+    telemetry_y = 105
+    font_t = pygame.font.Font(None, 16)
+    screen.blit(font_t.render("UNIT        LIVE COORD (X, Y)     VELOCITY VECTOR        GRID MISSION STATS", True, (40, 50, 45)), (20, telemetry_y))
+    for i, drone in enumerate(drones):
+        ry2 = telemetry_y + 18 + i * 16
+        screen.blit(font_t.render(f"UAV_{drone.id:02d}:", True, drone.neon_color), (20, ry2))
+        screen.blit(font_t.render(f"({int(drone.x)}, {int(drone.y)})", True, (50, 75, 120)), (90, ry2))
+        screen.blit(font_t.render(f"({drone.vx:+.2f}, {drone.vy:+.2f})", True, (110, 60, 40) if drone.state in ('landed', 'grounded') else (50, 110, 60)), (220, ry2))
+
+        drone_coverage = (len(drone.attended_cells) / total_cells * 100) if total_cells > 0 else 0
+        screen.blit(font_t.render(f"{len(drone.attended_cells)} targets ({drone_coverage:.1f}%)", True, (100, 50, 110)), (360, ry2))
+
+    pygame.display.flip()
+
+pygame.quit()
+sys.exit()
